@@ -1,6 +1,6 @@
 # Patch-22
 
-Patch-22 provides an `apply_patch` command you can put on your `PATH` as a safety net when a model tries to run `apply_patch` as a shell command.
+Patch-22 provides an `apply_patch` command you can put on your `PATH` as a safety net when [a model](https://github.com/openai/codex/issues/2235) tries to run `apply_patch` as a shell command.
 
 It can also optionally print an LLM-facing warning (or outright refuse to patch) to nudge the model back toward its native editing tool (see Configuration below).
 
