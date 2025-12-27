@@ -1,0 +1,21 @@
+/target/
+/tests/tmp_tests/
+/.letta/
+/vendor/
+**/*.rs.bk
+
+# Editors
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / temp
+*.log
+*.tmp
+*.temp

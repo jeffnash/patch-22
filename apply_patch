@@ -1,0 +1,889 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "apply_patch: python3 is required but was not found in PATH" >&2
+  exit 127
+fi
+
+PYTHON_CODE="$(
+  cat <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple, Union
+
+BEGIN_PATCH_MARKER = "*** Begin Patch"
+END_PATCH_MARKER = "*** End Patch"
+ADD_FILE_MARKER = "*** Add File: "
+DELETE_FILE_MARKER = "*** Delete File: "
+UPDATE_FILE_MARKER = "*** Update File: "
+MOVE_TO_MARKER = "*** Move to: "
+EOF_MARKER = "*** End of File"
+CHANGE_CONTEXT_MARKER = "@@ "
+EMPTY_CHANGE_CONTEXT_MARKER = "@@"
+
+DEFAULT_REFUSE_MESSAGE = r"""NOTE TO LLM:
+You just ran `apply_patch` as a shell command, not as a model-native editing tool.
+This environment is configured to refuse shell-based patching, so nothing was changed.
+
+Use your native editing tool (your built-in patch/editor tool) to apply this change now, and do not run `apply_patch` in the shell for future changes."""
+
+DEFAULT_WARN_MESSAGE = r"""NOTE TO LLM:
+The patch was applied by a shell `apply_patch` wrapper.
+For future changes, use your native editing tool instead of running `apply_patch` in the shell."""
+
+
+class ParseError(Exception):
+    pass
+
+
+class InvalidPatchError(ParseError):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+class InvalidHunkError(ParseError):
+    def __init__(self, *, message: str, line_number: int):
+        super().__init__(message)
+        self.message = message
+        self.line_number = line_number
+
+
+class IoError(Exception):
+    def __init__(self, *, context: str, source: str):
+        super().__init__(context)
+        self.context = context
+        self.source = source
+
+    def __str__(self) -> str:
+        return f"{self.context}: {self.source}"
+
+
+@dataclass
+class UpdateFileChunk:
+    change_context: Optional[str]
+    old_lines: List[str]
+    new_lines: List[str]
+    is_end_of_file: bool
+
+
+@dataclass
+class AddFileHunk:
+    path: str
+    contents: str
+
+
+@dataclass
+class DeleteFileHunk:
+    path: str
+
+
+@dataclass
+class UpdateFileHunk:
+    path: str
+    move_path: Optional[str]
+    chunks: List[UpdateFileChunk]
+
+
+Hunk = Union[AddFileHunk, DeleteFileHunk, UpdateFileHunk]
+
+
+@dataclass
+class AffectedPaths:
+    added: List[str]
+    modified: List[str]
+    deleted: List[str]
+
+
+@dataclass
+class Config:
+    mode: str = "apply"  # "apply" | "refuse" | "warn"
+    refuse_message: Optional[str] = None
+    warn_message: Optional[str] = None
+
+
+def _format_os_error(err: OSError) -> str:
+    errno = err.errno
+    if errno is None:
+        return str(err)
+    return f"{os.strerror(errno)} (os error {errno})"
+
+
+def _check_start_and_end_lines_strict(first: Optional[str], last: Optional[str]) -> None:
+    if (
+        first is not None
+        and last is not None
+        and first == BEGIN_PATCH_MARKER
+        and last == END_PATCH_MARKER
+    ):
+        return
+    if first is not None and first != BEGIN_PATCH_MARKER:
+        raise InvalidPatchError("The first line of the patch must be '*** Begin Patch'")
+    raise InvalidPatchError("The last line of the patch must be '*** End Patch'")
+
+
+def _check_patch_boundaries_strict(lines: Sequence[str]) -> None:
+    if len(lines) == 0:
+        first = None
+        last = None
+    elif len(lines) == 1:
+        first = lines[0]
+        last = lines[0]
+    else:
+        first = lines[0]
+        last = lines[-1]
+    _check_start_and_end_lines_strict(first, last)
+
+
+def _check_patch_boundaries_lenient(
+    original_lines: Sequence[str], original_error: InvalidPatchError
+) -> Sequence[str]:
+    if len(original_lines) >= 2:
+        first = original_lines[0]
+        last = original_lines[-1]
+        if (
+            first in ("<<EOF", "<<'EOF'", '<<"EOF"')
+            and last.endswith("EOF")
+            and len(original_lines) >= 4
+        ):
+            inner_lines = list(original_lines[1:-1])
+            _check_patch_boundaries_strict(inner_lines)
+            return inner_lines
+    raise original_error
+
+
+def parse_patch(patch: str) -> Tuple[List[Hunk], str]:
+    lines = patch.strip().splitlines()
+    try:
+        _check_patch_boundaries_strict(lines)
+    except InvalidPatchError as e:
+        lines = list(_check_patch_boundaries_lenient(lines, e))
+
+    hunks: List[Hunk] = []
+    last_line_index = max(len(lines) - 1, 0)
+    remaining_lines = lines[1:last_line_index]
+    line_number = 2
+    while remaining_lines:
+        hunk, hunk_lines = parse_one_hunk(remaining_lines, line_number)
+        hunks.append(hunk)
+        line_number += hunk_lines
+        remaining_lines = remaining_lines[hunk_lines:]
+
+    return hunks, "\n".join(lines)
+
+
+def parse_one_hunk(lines: Sequence[str], line_number: int) -> Tuple[Hunk, int]:
+    first_line = lines[0].strip()
+    if first_line.startswith(ADD_FILE_MARKER):
+        path = first_line[len(ADD_FILE_MARKER) :]
+        contents = ""
+        parsed_lines = 1
+        for add_line in lines[1:]:
+            if add_line.startswith("+"):
+                contents += add_line[1:] + "\n"
+                parsed_lines += 1
+            else:
+                break
+        return AddFileHunk(path=path, contents=contents), parsed_lines
+
+    if first_line.startswith(DELETE_FILE_MARKER):
+        path = first_line[len(DELETE_FILE_MARKER) :]
+        return DeleteFileHunk(path=path), 1
+
+    if first_line.startswith(UPDATE_FILE_MARKER):
+        path = first_line[len(UPDATE_FILE_MARKER) :]
+        remaining_lines = list(lines[1:])
+        parsed_lines = 1
+
+        move_path: Optional[str] = None
+        if remaining_lines and remaining_lines[0].startswith(MOVE_TO_MARKER):
+            move_path = remaining_lines[0][len(MOVE_TO_MARKER) :]
+            remaining_lines = remaining_lines[1:]
+            parsed_lines += 1
+
+        chunks: List[UpdateFileChunk] = []
+        while remaining_lines:
+            if remaining_lines[0].strip() == "":
+                remaining_lines = remaining_lines[1:]
+                parsed_lines += 1
+                continue
+            if remaining_lines[0].startswith("***"):
+                break
+
+            chunk, chunk_lines = parse_update_file_chunk(
+                remaining_lines,
+                line_number + parsed_lines,
+                allow_missing_context=(len(chunks) == 0),
+            )
+            chunks.append(chunk)
+            parsed_lines += chunk_lines
+            remaining_lines = remaining_lines[chunk_lines:]
+
+        if not chunks:
+            raise InvalidHunkError(
+                message=f"Update file hunk for path '{path}' is empty",
+                line_number=line_number,
+            )
+
+        return UpdateFileHunk(path=path, move_path=move_path, chunks=chunks), parsed_lines
+
+    raise InvalidHunkError(
+        message=(
+            f"'{first_line}' is not a valid hunk header. Valid hunk headers: "
+            "'*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'"
+        ),
+        line_number=line_number,
+    )
+
+
+def parse_update_file_chunk(
+    lines: Sequence[str],
+    line_number: int,
+    *,
+    allow_missing_context: bool,
+) -> Tuple[UpdateFileChunk, int]:
+    if not lines:
+        raise InvalidHunkError(
+            message="Update hunk does not contain any lines",
+            line_number=line_number,
+        )
+
+    if lines[0] == EMPTY_CHANGE_CONTEXT_MARKER:
+        change_context = None
+        start_index = 1
+    elif lines[0].startswith(CHANGE_CONTEXT_MARKER):
+        change_context = lines[0][len(CHANGE_CONTEXT_MARKER) :]
+        start_index = 1
+    else:
+        if not allow_missing_context:
+            raise InvalidHunkError(
+                message=f"Expected update hunk to start with a @@ context marker, got: '{lines[0]}'",
+                line_number=line_number,
+            )
+        change_context = None
+        start_index = 0
+
+    if start_index >= len(lines):
+        raise InvalidHunkError(
+            message="Update hunk does not contain any lines",
+            line_number=line_number + 1,
+        )
+
+    chunk = UpdateFileChunk(
+        change_context=change_context,
+        old_lines=[],
+        new_lines=[],
+        is_end_of_file=False,
+    )
+    parsed_lines = 0
+    for line in lines[start_index:]:
+        if line == EOF_MARKER:
+            if parsed_lines == 0:
+                raise InvalidHunkError(
+                    message="Update hunk does not contain any lines",
+                    line_number=line_number + 1,
+                )
+            chunk.is_end_of_file = True
+            parsed_lines += 1
+            break
+
+        if line == "":
+            chunk.old_lines.append("")
+            chunk.new_lines.append("")
+        else:
+            tag = line[0]
+            payload = line[1:]
+            if tag == " ":
+                chunk.old_lines.append(payload)
+                chunk.new_lines.append(payload)
+            elif tag == "+":
+                chunk.new_lines.append(payload)
+            elif tag == "-":
+                chunk.old_lines.append(payload)
+            else:
+                if parsed_lines == 0:
+                    raise InvalidHunkError(
+                        message=(
+                            f"Unexpected line found in update hunk: '{line}'. Every line should start with ' ' "
+                            "(context line), '+' (added line), or '-' (removed line)"
+                        ),
+                        line_number=line_number + 1,
+                    )
+                break
+
+        parsed_lines += 1
+
+    return chunk, parsed_lines + start_index
+
+
+def _normalise(s: str) -> str:
+    dash = {
+        "\u2010",
+        "\u2011",
+        "\u2012",
+        "\u2013",
+        "\u2014",
+        "\u2015",
+        "\u2212",
+    }
+    single_quote = {"\u2018", "\u2019", "\u201A", "\u201B"}
+    double_quote = {"\u201C", "\u201D", "\u201E", "\u201F"}
+    spaces = {
+        "\u00A0",
+        "\u2002",
+        "\u2003",
+        "\u2004",
+        "\u2005",
+        "\u2006",
+        "\u2007",
+        "\u2008",
+        "\u2009",
+        "\u200A",
+        "\u202F",
+        "\u205F",
+        "\u3000",
+    }
+    s = s.strip()
+    out = []
+    for c in s:
+        if c in dash:
+            out.append("-")
+        elif c in single_quote:
+            out.append("'")
+        elif c in double_quote:
+            out.append('"')
+        elif c in spaces:
+            out.append(" ")
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def seek_sequence(lines: Sequence[str], pattern: Sequence[str], start: int, eof: bool) -> Optional[int]:
+    if len(pattern) == 0:
+        return start
+    if len(pattern) > len(lines):
+        return None
+
+    if eof and len(lines) >= len(pattern):
+        search_start = len(lines) - len(pattern)
+    else:
+        search_start = start
+
+    last_start = len(lines) - len(pattern)
+    if search_start > last_start:
+        return None
+
+    for i in range(search_start, last_start + 1):
+        if list(lines[i : i + len(pattern)]) == list(pattern):
+            return i
+
+    for i in range(search_start, last_start + 1):
+        ok = True
+        for p_idx, pat in enumerate(pattern):
+            if lines[i + p_idx].rstrip() != pat.rstrip():
+                ok = False
+                break
+        if ok:
+            return i
+
+    for i in range(search_start, last_start + 1):
+        ok = True
+        for p_idx, pat in enumerate(pattern):
+            if lines[i + p_idx].strip() != pat.strip():
+                ok = False
+                break
+        if ok:
+            return i
+
+    for i in range(search_start, last_start + 1):
+        ok = True
+        for p_idx, pat in enumerate(pattern):
+            if _normalise(lines[i + p_idx]) != _normalise(pat):
+                ok = False
+                break
+        if ok:
+            return i
+
+    return None
+
+
+def compute_replacements(
+    original_lines: Sequence[str],
+    path: Path,
+    chunks: Sequence[UpdateFileChunk],
+) -> List[Tuple[int, int, List[str]]]:
+    replacements: List[Tuple[int, int, List[str]]] = []
+    line_index = 0
+
+    for chunk in chunks:
+        if chunk.change_context is not None:
+            found = seek_sequence(original_lines, [chunk.change_context], line_index, False)
+            if found is None:
+                raise Exception(
+                    f"Failed to find context '{chunk.change_context}' in {path}"
+                )
+            line_index = found + 1
+
+        if len(chunk.old_lines) == 0:
+            insertion_idx = (
+                len(original_lines) - 1
+                if len(original_lines) > 0 and original_lines[-1] == ""
+                else len(original_lines)
+            )
+            replacements.append((insertion_idx, 0, list(chunk.new_lines)))
+            continue
+
+        pattern: Sequence[str] = chunk.old_lines
+        found = seek_sequence(original_lines, pattern, line_index, chunk.is_end_of_file)
+        new_slice: Sequence[str] = chunk.new_lines
+
+        if found is None and len(pattern) > 0 and pattern[-1] == "":
+            pattern = pattern[:-1]
+            if len(new_slice) > 0 and new_slice[-1] == "":
+                new_slice = new_slice[:-1]
+            found = seek_sequence(original_lines, pattern, line_index, chunk.is_end_of_file)
+
+        if found is None:
+            raise Exception(
+                f"Failed to find expected lines in {path}:\n" + "\n".join(chunk.old_lines)
+            )
+
+        replacements.append((found, len(pattern), list(new_slice)))
+        line_index = found + len(pattern)
+
+    replacements.sort(key=lambda t: t[0])
+    return replacements
+
+
+def apply_replacements(lines: List[str], replacements: Sequence[Tuple[int, int, List[str]]]) -> List[str]:
+    for start_idx, old_len, new_segment in reversed(list(replacements)):
+        del lines[start_idx : start_idx + old_len]
+        lines[start_idx:start_idx] = new_segment
+    return lines
+
+
+def derive_new_contents_from_chunks(path: Path, chunks: Sequence[UpdateFileChunk]) -> str:
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        raise IoError(
+            context=f"Failed to read file to update {path}",
+            source=_format_os_error(e),
+        )
+    try:
+        original_contents = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise IoError(
+            context=f"Failed to read file to update {path}",
+            source="stream did not contain valid UTF-8",
+        )
+
+    original_lines = original_contents.split("\n")
+    if len(original_lines) > 0 and original_lines[-1] == "":
+        original_lines.pop()
+
+    replacements = compute_replacements(original_lines, path, chunks)
+    new_lines = apply_replacements(list(original_lines), replacements)
+    if not (len(new_lines) > 0 and new_lines[-1] == ""):
+        new_lines.append("")
+    return "\n".join(new_lines)
+
+
+def apply_hunks_to_files(hunks: Sequence[Hunk]) -> AffectedPaths:
+    if len(hunks) == 0:
+        raise Exception("No files were modified.")
+
+    added: List[str] = []
+    modified: List[str] = []
+    deleted: List[str] = []
+
+    for hunk in hunks:
+        if isinstance(hunk, AddFileHunk):
+            path = Path(hunk.path)
+            parent = path.parent
+            if str(parent) not in ("", "."):
+                try:
+                    parent.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    raise Exception(
+                        f"Failed to create parent directories for {path}: {_format_os_error(e)}"
+                    )
+            try:
+                path.write_bytes(hunk.contents.encode("utf-8"))
+            except OSError as e:
+                raise Exception(f"Failed to write file {path}: {_format_os_error(e)}")
+            added.append(str(path))
+            continue
+
+        if isinstance(hunk, DeleteFileHunk):
+            path = Path(hunk.path)
+            try:
+                path.unlink()
+            except OSError as e:
+                raise Exception(f"Failed to delete file {path}: {_format_os_error(e)}")
+            deleted.append(str(path))
+            continue
+
+        if isinstance(hunk, UpdateFileHunk):
+            path = Path(hunk.path)
+            new_contents = derive_new_contents_from_chunks(path, hunk.chunks)
+
+            if hunk.move_path is not None:
+                dest = Path(hunk.move_path)
+                parent = dest.parent
+                if str(parent) not in ("", "."):
+                    try:
+                        parent.mkdir(parents=True, exist_ok=True)
+                    except OSError as e:
+                        raise Exception(
+                            f"Failed to create parent directories for {dest}: {_format_os_error(e)}"
+                        )
+                try:
+                    dest.write_bytes(new_contents.encode("utf-8"))
+                except OSError as e:
+                    raise Exception(f"Failed to write file {dest}: {_format_os_error(e)}")
+                try:
+                    path.unlink()
+                except OSError as e:
+                    raise Exception(
+                        f"Failed to remove original {path}: {_format_os_error(e)}"
+                    )
+                modified.append(str(dest))
+            else:
+                try:
+                    path.write_bytes(new_contents.encode("utf-8"))
+                except OSError as e:
+                    raise Exception(f"Failed to write file {path}: {_format_os_error(e)}")
+                modified.append(str(path))
+            continue
+
+        raise Exception("Unknown hunk type")
+
+    return AffectedPaths(added=added, modified=modified, deleted=deleted)
+
+
+def print_summary(affected: AffectedPaths, out: "TextWriter") -> None:
+    out.write("Success. Updated the following files:\n")
+    for path in affected.added:
+        out.write(f"A {path}\n")
+    for path in affected.modified:
+        out.write(f"M {path}\n")
+    for path in affected.deleted:
+        out.write(f"D {path}\n")
+
+
+def apply_patch_to_disk(patch: str, stdout: "TextWriter", stderr: "TextWriter") -> None:
+    try:
+        hunks, _ = parse_patch(patch)
+    except InvalidPatchError as e:
+        stderr.write(f"Invalid patch: {e.message}\n")
+        raise
+    except InvalidHunkError as e:
+        stderr.write(f"Invalid patch hunk on line {e.line_number}: {e.message}\n")
+        raise
+
+    try:
+        affected = apply_hunks_to_files(hunks)
+    except Exception as e:
+        stderr.write(f"{e}\n")
+        raise
+
+    print_summary(affected, stdout)
+
+
+def _read_stdin_patch() -> str:
+    try:
+        data = sys.stdin.buffer.read()
+    except OSError as e:
+        raise Exception(
+            "Error: Failed to read PATCH from stdin.\n" + _format_os_error(e)
+        ) from e
+
+    if data == b"":
+        raise Exception("Usage: apply_patch 'PATCH'\n       echo 'PATCH' | apply-patch")
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Exception("Error: Failed to read PATCH from stdin.\nstream did not contain valid UTF-8")
+
+
+_UNSET = object()
+
+
+def _config_path() -> Optional[Path]:
+    override = os.environ.get("APPLY_PATCH_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        base = Path(xdg)
+    else:
+        home = os.environ.get("HOME")
+        if not home:
+            try:
+                home = str(Path.home())
+            except Exception:
+                return None
+        base = Path(home)
+    return base / ".apply_patch" / "config.json"
+
+
+def _load_config(path: Path) -> Config:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        return Config()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return Config()
+    return Config(
+        mode=str(data.get("mode", "apply")),
+        refuse_message=data.get("refuse_message"),
+        warn_message=data.get("warn_message"),
+    )
+
+
+def _save_config(path: Path, cfg: Config) -> None:
+    if path.parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(
+            {
+                "mode": cfg.mode,
+                "refuse_message": cfg.refuse_message,
+                "warn_message": cfg.warn_message,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    tmp.replace(path)
+
+
+def _print_help() -> None:
+    sys.stdout.write(
+        "apply_patch\n\n"
+        "Applies Codex-style *** Begin Patch patches from stdin (or a single PATCH argument).\n\n"
+        "Config flags (persist in your home directory):\n"
+        "  --show-config\n"
+        "  --mode <apply|refuse|warn>   (aliases: --apply, --refuse, --warn)\n"
+        "  --set-refuse-message <text>\n"
+        "  --clear-refuse-message\n"
+        "  --set-warn-message <text>\n"
+        "  --clear-warn-message\n\n"
+        "Notes:\n"
+        "  - Config is stored at $XDG_CONFIG_HOME/.apply_patch/config.json (or ~/.apply_patch/config.json).\n"
+        "  - You can override the config path with $APPLY_PATCH_CONFIG.\n"
+    )
+
+
+def _parse_mode(val: str) -> Optional[str]:
+    if val in ("apply", "refuse", "warn"):
+        return val
+    return None
+
+
+def _run_config_command(args: List[str]) -> Optional[int]:
+    show = False
+    mode: Optional[str] = None
+    refuse_message: object = _UNSET
+    warn_message: object = _UNSET
+    positional: List[str] = []
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            _print_help()
+            return 0
+        if a == "--show-config":
+            show = True
+            i += 1
+            continue
+        if a == "--mode":
+            if i + 1 >= len(args):
+                sys.stderr.write("Error: --mode requires a value.\n")
+                return 2
+            parsed = _parse_mode(args[i + 1])
+            if parsed is None:
+                sys.stderr.write(f"Error: invalid --mode value: {args[i + 1]}\n")
+                return 2
+            mode = parsed
+            i += 2
+            continue
+        if a == "--apply":
+            mode = "apply"
+            i += 1
+            continue
+        if a == "--refuse":
+            mode = "refuse"
+            i += 1
+            continue
+        if a == "--warn":
+            mode = "warn"
+            i += 1
+            continue
+        if a == "--set-refuse-message":
+            if i + 1 >= len(args):
+                sys.stderr.write("Error: --set-refuse-message requires a value.\n")
+                return 2
+            refuse_message = args[i + 1]
+            i += 2
+            continue
+        if a == "--clear-refuse-message":
+            refuse_message = None
+            i += 1
+            continue
+        if a == "--set-warn-message":
+            if i + 1 >= len(args):
+                sys.stderr.write("Error: --set-warn-message requires a value.\n")
+                return 2
+            warn_message = args[i + 1]
+            i += 2
+            continue
+        if a == "--clear-warn-message":
+            warn_message = None
+            i += 1
+            continue
+
+        if a.startswith("-"):
+            sys.stderr.write(f"Error: unknown option: {a}\n")
+            return 2
+        positional.append(a)
+        i += 1
+
+    has_config_flags = (
+        show
+        or mode is not None
+        or refuse_message is not _UNSET
+        or warn_message is not _UNSET
+    )
+
+    if not has_config_flags:
+        return None
+
+    if positional:
+        sys.stderr.write(
+            "Error: configuration flags cannot be combined with a PATCH argument.\n"
+        )
+        return 2
+
+    path = _config_path()
+    if path is None:
+        sys.stderr.write(
+            "Error: could not determine config path (HOME/XDG_CONFIG_HOME not set).\n"
+        )
+        return 1
+
+    cfg = _load_config(path)
+    if mode is not None:
+        cfg.mode = mode
+    if refuse_message is not _UNSET:
+        cfg.refuse_message = refuse_message if isinstance(refuse_message, str) else None
+    if warn_message is not _UNSET:
+        cfg.warn_message = warn_message if isinstance(warn_message, str) else None
+
+    if mode is not None or refuse_message is not _UNSET or warn_message is not _UNSET:
+        try:
+            _save_config(path, cfg)
+        except Exception as e:
+            sys.stderr.write(f"Error: failed to write config: {e}\n")
+            return 1
+
+    if show:
+        sys.stdout.write(f"Config file: {path}\n")
+        sys.stdout.write(f"mode: {cfg.mode}\n")
+        sys.stdout.write(
+            "refuse_message: "
+            + ("custom\n" if cfg.refuse_message is not None else "default\n")
+        )
+        sys.stdout.write(
+            "warn_message: " + ("custom\n" if cfg.warn_message is not None else "default\n")
+        )
+    else:
+        sys.stdout.write(f"Updated config: {path}\n")
+
+    return 0
+
+
+def run_main(argv: Sequence[str]) -> int:
+    args = list(argv[1:])
+
+    cfg_code = _run_config_command(args)
+    if cfg_code is not None:
+        return cfg_code
+
+    cfg_path = _config_path()
+    cfg = _load_config(cfg_path) if cfg_path is not None else Config()
+
+    if len(args) == 0:
+        try:
+            patch_arg = _read_stdin_patch()
+        except Exception as e:
+            msg = str(e)
+            # The Rust implementation uses exit code 2 only for usage errors.
+            if msg.startswith("Usage:"):
+                sys.stderr.write(msg + "\n")
+                return 2
+            if msg.startswith("Error: apply_patch accepts exactly one argument."):
+                sys.stderr.write(msg + "\n")
+                return 2
+            if msg.startswith("Error:"):
+                sys.stderr.write(msg + "\n")
+                return 1
+            sys.stderr.write(msg + "\n")
+            return 1
+    elif len(args) == 1:
+        patch_arg = args[0]
+        try:
+            patch_arg.encode("utf-8")
+        except UnicodeEncodeError:
+            sys.stderr.write("Error: apply_patch requires a UTF-8 PATCH argument.\n")
+            return 1
+    else:
+        sys.stderr.write("Error: apply_patch accepts exactly one argument.\n")
+        return 2
+
+    if cfg.mode == "refuse":
+        msg = cfg.refuse_message or DEFAULT_REFUSE_MESSAGE
+        sys.stdout.write(msg + "\n")
+        return 0
+
+    try:
+        apply_patch_to_disk(patch_arg, sys.stdout, sys.stderr)
+    except Exception:
+        return 1
+
+    if cfg.mode == "warn":
+        msg = cfg.warn_message or DEFAULT_WARN_MESSAGE
+        sys.stdout.write(msg + "\n")
+
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_main(sys.argv))
+PY
+)"
+
+python3 -c "$PYTHON_CODE" "$@"
