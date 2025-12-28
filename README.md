@@ -22,7 +22,24 @@ PATCH
 
 ## Why “Patch-22”?
 
-Because it’s a patch-shaped Catch‑22: the model keeps trying to run `apply_patch` as a shell command, and the whole point is to convince it to stop. So this repo provides a safety net (apply/refuse/warn) that hopefully gets used once, prints a stern note, and then never gets invoked again.
+Because it’s a patch-shaped Catch‑22: if a model is convinced `apply_patch` is a shell command, it will keep trying it. Adding a real `apply_patch` makes the failure go away — but also “confirms” the habit.
+
+Alas, sometimes the best solution is a carefully contained hack.
+
+Like a fine wine, Patch-22 goes especially well when paired with the [`jeffnash/CLIProxyAPI`](https://github.com/jeffnash/CLIProxyAPI) fork (hosted on Railway) so those models can be used inside other coding tools. In that setup, this repo is the safety net: apply the patch anyway, or refuse/warn loudly enough that the model learns to stop trying (see Configuration below).
+
+If you're looking for a coding tool to test this out with, I highly recommend the vastly-underrated [Letta Code](https://docs.letta.com/letta-code/index.md) (and the broader [Letta](https://letta.com) ecosystem).
+
+The `jeffnash` forks — [`jeffnash/letta-code`](https://github.com/jeffnash/letta-code) and [`jeffnash/letta`](https://github.com/jeffnash/letta) — are wired up to route the main model calls through an also-Railway-hosted [`jeffnash/CLIProxyAPI`](https://github.com/jeffnash/CLIProxyAPI) server, while still using the standard OpenAI API for embeddings (cheap).
+
+The `jeffnash/letta` fork also includes scripts to make deploying the Letta server to Railway easy.
+
+Links:
+- [`jeffnash/CLIProxyAPI`](https://github.com/jeffnash/CLIProxyAPI)
+- [`jeffnash/letta-code`](https://github.com/jeffnash/letta-code)
+- [`jeffnash/letta`](https://github.com/jeffnash/letta)
+- [Letta](https://letta.com)
+- [Letta Code docs](https://docs.letta.com/letta-code/index.md)
 
 ## Install
 
